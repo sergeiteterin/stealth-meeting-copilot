@@ -1,8 +1,12 @@
 # Stealth
 
-Native macOS **Cluely clone** — a meeting copilot. Captures meeting audio, live-transcribes both sides, and on a hotkey suggests a natural-English reply. Built for a non-native English speaker on calls with Australian/US speakers.
+Native macOS meeting copilot (fork of vortechron/stealth). Captures meeting audio, live-transcribes both sides in English, translates each line to Russian, auto-detects the other side's questions and suggests a short B1–B2 English reply grounded in a Markdown meeting profile. The user is a Russian speaker; UI strings are Russian.
 
-**Status:** MVP working end-to-end (confirmed live). English only, Phase 1.
+**Status:** in daily testing by the owner. Streaming transcription, simultaneous translation (Russian accepted by `gpt-realtime-translate`), per-sentence translation, summaries and note export have run against the live API. Goal assessment, the cost meter's accuracy and hour-long stability have NOT been verified live.
+
+Tests: `xcodebuild -project Stealth.xcodeproj -scheme Stealth -derivedDataPath build test` (logic only, no network). Demo UI without a key: `open /Applications/Stealth.app --args -demo YES` (add `-snapshotDir <dir>` to dump window PNGs — the overlay is excluded from screenshots, so this is the only way to see it from the terminal). If `xcode-select` points at CommandLineTools, prefix with `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
+
+**Do not rebuild or relaunch casually.** Every rebuild changes the binary's cdhash; the keychain ACL of the API key is cdhash-bound (the local signing cert is not system-trusted), so the next key read shows a blocking macOS password prompt. The key is therefore read only on Start (`KeychainStore.exists()` at launch never prompts). Killing a process that is waiting on that prompt leaves an orphan dialog on the user's screen.
 
 ## Run / build
 
@@ -25,11 +29,14 @@ Two audio sources, each with its own OpenAI Realtime transcription session:
 System audio (ScreenCaptureKit)  → RealtimeClient(speaker: .them) ─┐
 Microphone   (AVAudioEngine+AEC)  → RealtimeClient(speaker: .you)  ─┤
                                                                     ├→ TranscriptStore (speaker-labelled, timestamped)
-[⌥Space hotkey] → systemRealtime.requestSuggestion(context) ───────┴→ SuggestionStore → OverlayView card
+System audio also → LiveTranslationClient (gpt-realtime-translate) → Russian sentences → TranscriptStore.translatedStream
+  (fallback: each finished line → TextLLMClient (chat completions, SSE) → RU translation streamed into the line)
+Them question (QuestionDetector, local, 8 s cool-down) or ⌥Space → TextLLMClient + profile Markdown + goal statuses → SuggestionStore
+Every 25 s → TextLLMClient goal check → GoalStore (checklist)      On Stop → summary → SessionStore + NoteExporter (notes folder)
 ```
 
 - `AppCoordinator` (`Sources/Stealth/Stores/`) wires everything; the single source of truth for app state.
-- `RealtimeClient` is **per-speaker**; only the `.them` client (`handlesSuggestions: true`) generates reply suggestions.
+- `RealtimeClient` is **per-speaker** and transcription-only; it auto-reconnects with back-off on unexpected drops. Suggestions and translation use the text API, never the Realtime socket.
 - Mic uses **acoustic echo cancellation** (`setVoiceProcessingEnabled(true)`) so speaker audio bleeding into the mic isn't mislabeled "You".
 - Overlay is an `NSPanel` with `sharingType = .none` → **invisible to screen capture/sharing** (the "stealth"). Floating, all Spaces, draggable, resizable (bottom-right handle).
 
@@ -40,7 +47,17 @@ Microphone   (AVAudioEngine+AEC)  → RealtimeClient(speaker: .you)  ─┤
 - `Support/DebugLog.swift` — file logger.
 - `Audio/AudioCaptureManager.swift` — system audio via ScreenCaptureKit → 24kHz PCM16.
 - `Audio/MicCaptureManager.swift` — mic via AVAudioEngine + AEC → 24kHz PCM16.
-- `Realtime/RealtimeClient.swift` — one WebSocket session (transcription + optional suggestions).
+- `Realtime/RealtimeClient.swift` — one WebSocket session (transcription only, auto-reconnect).
+- `LLM/TextLLMClient.swift` + `SSEParser.swift` — streaming text API for translation and suggestions.
+- `LLM/QuestionDetector.swift` — local heuristic that triggers auto-suggestions.
+- `Context/ProfileStore.swift` — meeting profiles as Markdown in `~/Library/Application Support/Stealth/profiles/` (seeded once from `Resources/Profiles/`).
+- `Support/AppSettings.swift` — user switches (translation, auto-suggest, font scale, profile, consent).
+- `Support/DemoMode.swift` — `-demo YES` sample data + window snapshots.
+- `Realtime/LiveTranslationClient.swift` — simultaneous translation socket (`/v1/realtime/translations`); translated audio is discarded.
+- `LLM/SentenceSegmenter.swift` — cuts a text stream into sentences; `SilenceDetector` (client VAD for streaming mode); `TranslationPairer` (RU sentence ↔ EN line, feed layout only).
+- `Context/GoalStore.swift` — goals parsed from the profile's "Meeting goals" section + statuses.
+- `Stores/NoteExporter.swift` — Markdown note with YAML front matter into a user-chosen folder.
+- `Support/CostMeter.swift` — session cost estimate; **price tables live here** and need updating when OpenAI changes prices.
 - `Stores/TranscriptStore.swift` — `[TranscriptLine{speaker,at,content}]` + per-speaker partials.
 - `Stores/SuggestionStore.swift` — latest suggested reply + loading/error.
 - `Stores/AppCoordinator.swift` — pipeline wiring + lifecycle.
@@ -54,9 +71,11 @@ Microphone   (AVAudioEngine+AEC)  → RealtimeClient(speaker: .you)  ─┤
 
 - **Native Swift/SwiftUI**, NOT Electron (ScreenCaptureKit + stealth overlay are hard in web stacks).
 - **No backend** — app calls OpenAI directly. Laravel + Laravel Boost deferred to Phase 2 (needed for hiding the API key when distributing).
-- **OpenAI Realtime API (GA)** over WebSocket. Model `gpt-realtime`. Transcription model `gpt-4o-transcribe`.
+- **OpenAI Realtime API (GA)** over WebSocket. Default transcription: `gpt-live-transcribe` on `?intent=transcription` (session type `transcription`, no server VAD — the client commits on silence). Fallback: `gpt-realtime` session with `gpt-4o-transcribe` and server VAD (the upstream path; gotchas 1–3 below apply to it).
 - **API key in Keychain**, direct connection. **This is a personal build — never distribute it** (the key would leak).
-- **Manual hotkey** for suggestions (⌥Space), not auto question-detection. ⌥H = show/hide overlay.
+- Suggestions fire **automatically on a detected question** and manually on ⌥Space. ⌥H = show/hide overlay.
+- **Audio consent**: nothing is streamed until the user accepts the one-time alert (`AppSettings.audioConsentGiven`).
+- Model names are user-overridable (`Config.ModelKey`, Settings) because OpenAI retires models.
 - **Two-sided transcript**: mic (You, blue) + system (Them, green), each timestamped (HH:mm).
 
 ## Critical gotchas (all hit during first live bring-up — don't regress these)

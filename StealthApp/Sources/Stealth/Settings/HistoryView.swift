@@ -5,10 +5,12 @@ import AppKit
 /// on the left, the full speaker-labelled transcript on the right.
 struct HistoryView: View {
     @ObservedObject var sessions: SessionStore
+    @ObservedObject var coordinator: AppCoordinator
     @State private var selectedID: SessionRecord.ID?
 
-    init(store: SessionStore) {
-        self.sessions = store
+    init(coordinator: AppCoordinator) {
+        self.coordinator = coordinator
+        self.sessions = coordinator.sessions
     }
 
     private var selected: SessionRecord? {
@@ -29,11 +31,11 @@ struct HistoryView: View {
 
     private var sessionList: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Sessions")
+            Text("Встречи")
                 .font(.headline)
                 .padding(12)
             if sessions.sessions.isEmpty {
-                Text("No saved sessions yet.\nStop a listening session to save it here.")
+                Text("Сохранённых встреч пока нет.\nРазговор сохраняется сюда после «Стоп».")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(12)
@@ -44,7 +46,7 @@ struct HistoryView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(session.title)
                                 .font(.system(size: 13, weight: .medium))
-                            Text("\(session.lineCount) lines · \(session.durationLabel)")
+                            Text("\(session.lineCount) реплик · \(session.durationLabel)")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -57,6 +59,19 @@ struct HistoryView: View {
         .frame(width: 220)
     }
 
+    /// Markdown → attributed text, keeping the line breaks of headings and lists.
+    private static func rendered(_ markdown: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        let plainHeadings = markdown
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> String in
+                let t = line.trimmingCharacters(in: .whitespaces)
+                return t.hasPrefix("## ") ? "**\(t.dropFirst(3))**" : String(line)
+            }
+            .joined(separator: "\n")
+        return (try? AttributedString(markdown: plainHeadings, options: options)) ?? AttributedString(markdown)
+    }
+
     @ViewBuilder
     private var detail: some View {
         if let session = selected {
@@ -64,25 +79,58 @@ struct HistoryView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(session.title).font(.headline)
-                        Text("\(session.lineCount) lines · \(session.durationLabel)")
+                        Text([session.profile, "\(session.lineCount) реплик", session.durationLabel,
+                              session.costUSD.map(CostMeter.format)].compactMap { $0 }.joined(separator: " · "))
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Button {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(session.plainText, forType: .string)
-                    } label: { Label("Copy", systemImage: "doc.on.doc") }
+                    } label: { Label("Копировать", systemImage: "doc.on.doc") }
+                    Button {
+                        coordinator.summarize(session)
+                    } label: {
+                        Label(coordinator.summarizingID == session.id ? "Пишу…" : (session.summary == nil ? "Резюме" : "Обновить резюме"),
+                              systemImage: "text.badge.checkmark")
+                    }
+                    .disabled(coordinator.summarizingID != nil)
+                    .help("Итоги, договорённости, задачи и черновик письма по этой встрече")
+                    Button {
+                        TranscriptExporter.export(session)
+                    } label: { Label("Сохранить…", systemImage: "square.and.arrow.down") }
                     Button(role: .destructive) {
                         let toDelete = session
                         selectedID = nil
                         sessions.delete(toDelete)
                         selectedID = sessions.sessions.first?.id
-                    } label: { Label("Delete", systemImage: "trash") }
+                    } label: { Label("Удалить", systemImage: "trash") }
                 }
                 .padding(12)
                 Divider()
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
+                        if let summary = session.summary, !summary.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Резюме встречи").font(.system(size: 12, weight: .bold))
+                                    Spacer()
+                                    Button {
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(summary, forType: .string)
+                                    } label: { Label("Копировать резюме", systemImage: "doc.on.doc") }
+                                        .buttonStyle(.borderless)
+                                        .font(.caption)
+                                }
+                                Text(Self.rendered(summary))
+                                    .font(.system(size: 13))
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(10)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.10)))
+                            .padding(.bottom, 6)
+                        }
                         ForEach(session.lines) { line in
                             VStack(alignment: .leading, spacing: 1) {
                                 HStack(spacing: 6) {
@@ -97,6 +145,13 @@ struct HistoryView: View {
                                     .font(.system(size: 13))
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading)
+                                if let ru = line.translation {
+                                    Text(ru)
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
                             }
                         }
                     }
@@ -106,7 +161,7 @@ struct HistoryView: View {
         } else {
             VStack {
                 Spacer()
-                Text("Select a session").foregroundStyle(.secondary)
+                Text("Выберите встречу").foregroundStyle(.secondary)
                 Spacer()
             }
             .frame(maxWidth: .infinity)

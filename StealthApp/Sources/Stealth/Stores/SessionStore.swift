@@ -41,19 +41,36 @@ final class SessionStore: ObservableObject {
         return dir
     }
 
-    /// Build a record from live transcript lines and persist it.
+    /// Build a record from live transcript lines and persist it. Passing the same
+    /// `id` again overwrites the earlier save — used for periodic autosave during
+    /// a call, so a crash loses at most a few lines.
     /// No-op when there are no lines (an empty session isn't worth saving).
     @discardableResult
-    func save(lines: [TranscriptLine], startedAt: Date, endedAt: Date = Date()) -> SessionRecord? {
+    func save(id: UUID = UUID(), lines: [TranscriptLine], startedAt: Date,
+              endedAt: Date = Date(), profile: String? = nil, costUSD: Double? = nil) -> SessionRecord? {
         guard !lines.isEmpty else { return nil }
-        let record = SessionRecord(
+        var record = SessionRecord(
+            id: id,
             startedAt: startedAt,
             endedAt: endedAt,
-            lines: lines.map(SessionLine.init(from:))
+            lines: lines.map(SessionLine.init(from:)),
+            profile: profile,
+            summary: sessions.first { $0.id == id }?.summary
         )
+        record.costUSD = costUSD
         persist(record)
-        sessions = ([record] + sessions).sorted { $0.startedAt > $1.startedAt }
+        sessions = ([record] + sessions.filter { $0.id != id }).sorted { $0.startedAt > $1.startedAt }
         return record
+    }
+
+    /// Store (or replace) the after-meeting notes of a saved session.
+    func setSummary(_ summary: String, for id: UUID, costUSD: Double? = nil) {
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+        var record = sessions[index]
+        record.summary = summary
+        if let costUSD { record.costUSD = costUSD }
+        persist(record)
+        sessions[index] = record
     }
 
     func delete(_ record: SessionRecord) {

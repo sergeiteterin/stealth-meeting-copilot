@@ -14,7 +14,13 @@ BUILD_NUMBER="$(date +%Y%m%d.%H%M)"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
 echo "Build: v$VERSION ($BUILD_NUMBER)"
 
-/opt/homebrew/bin/xcodegen generate >/dev/null
+# xcodebuild needs full Xcode. If xcode-select points at the Command Line Tools,
+# use Xcode.app for this build only (no sudo / global change needed).
+if ! xcodebuild -version >/dev/null 2>&1 && [[ -d /Applications/Xcode.app ]]; then
+  export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+fi
+
+"$(command -v xcodegen || echo /opt/homebrew/bin/xcodegen)" generate >/dev/null
 # Release config: links into a single binary (no separate Stealth.debug.dylib,
 # which otherwise breaks re-signing with a custom identity).
 xcodebuild -project Stealth.xcodeproj -scheme Stealth -configuration Release \
@@ -24,7 +30,9 @@ BUILT="build/Build/Products/Release/Stealth.app"
 DEST="/Applications/Stealth.app"
 
 # Pick a stable identity if available, else ad-hoc.
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "Stealth Local Signing"; then
+# (No `-v`: a self-signed identity that isn't system-trusted still signs fine and
+# still gives a stable signature — it is just not listed as "valid".)
+if security find-identity -p codesigning 2>/dev/null | grep -q "Stealth Local Signing"; then
   SIGN_ID="Stealth Local Signing"
   echo "Signing with stable identity: $SIGN_ID"
 else

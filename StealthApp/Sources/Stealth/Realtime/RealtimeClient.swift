@@ -1,72 +1,112 @@
 import Foundation
 import OSLog
 
-/// Drives the OpenAI Realtime API over a WebSocket.
+/// Drives one OpenAI Realtime API session over a WebSocket — transcription only.
 ///
 /// Responsibilities:
 ///  - connect with the Keychain API key
 ///  - configure the session for input-audio transcription (live transcript)
-///  - stream system audio up as base64 PCM16
-///  - surface transcription deltas (the other people's speech → text)
-///  - on demand, request a single text suggestion using recent transcript context
+///  - stream one audio source up as base64 PCM16
+///  - surface transcription deltas + completed lines
+///  - reconnect automatically after an unexpected drop (network blip, or the
+///    server-side session duration cap on long calls)
 ///
-/// All published callbacks are invoked on the main actor.
+/// Translation and reply suggestions are NOT done here — they go through the
+/// text API (`TextLLMClient`). All callbacks are invoked on the main actor.
 @MainActor
 final class RealtimeClient: NSObject, ObservableObject {
     enum ConnectionState: Equatable {
         case disconnected
         case connecting
         case connected
+        case reconnecting
         case failed(String)
     }
 
-    @Published private(set) var state: ConnectionState = .disconnected
+    @Published private(set) var state: ConnectionState = .disconnected {
+        didSet { if state != oldValue { onStateChange?() } }
+    }
 
     /// Which side of the conversation this client transcribes.
     let speaker: Speaker
 
-    /// Only the client that owns conversation context (the "them" side) generates
-    /// reply suggestions. The mic client transcribes only.
-    let handlesSuggestions: Bool
-
-    init(speaker: Speaker, handlesSuggestions: Bool) {
+    init(speaker: Speaker) {
         self.speaker = speaker
-        self.handlesSuggestions = handlesSuggestions
         super.init()
     }
 
     // Callbacks wired up by the coordinator.
     var onTranscriptDelta: ((String, Speaker) -> Void)?
     var onTranscriptCompleted: ((String, Speaker) -> Void)?
-    var onSuggestionDelta: ((String) -> Void)?
-    var onSuggestionDone: (() -> Void)?
+    /// Streaming mode: the not-yet-finished tail of the current sentence.
+    var onPartialReplaced: ((String, Speaker) -> Void)?
     var onError: ((String) -> Void)?
+    var onStateChange: (() -> Void)?
 
     private let log = Logger(subsystem: "com.stealth.app", category: "realtime")
     private var task: URLSessionWebSocketTask?
     private var session: URLSession?
-    private var tone: ReplyTone = .professional
 
-    // Tracks which response is a user-requested suggestion vs. background activity.
-    private var pendingSuggestionResponseID: String?
+    /// True between `connect()` and `disconnect()` — i.e. the user wants this
+    /// session up, so an unexpected drop triggers a reconnect.
+    private var wantsConnection = false
+    private var reconnectAttempt = 0
+    private var reconnectWork: Task<Void, Never>?
 
-    // Set during an intentional disconnect so the receive-loop failure is silent.
-    private var isClosing = false
+    // --- Streaming transcription mode (gpt-live-*) ---
+    /// True while this socket runs a streaming transcription session: text arrives
+    /// during speech, the client cuts it into sentences and signals utterance ends.
+    private var streaming = false
+    /// Set when the API rejected the streaming session; stay on the proven
+    /// phrase-by-phrase model for the rest of this run.
+    private var streamingRejected = false
+    private var segmenter = SentenceSegmenter()
+    private lazy var silenceDetector = SilenceDetector(speechThreshold: Config.speechRMSThreshold(for: speaker))
 
-    func setTone(_ tone: ReplyTone) { self.tone = tone }
+    /// The transcription model this socket is actually using (after any fallback).
+    var activeTranscriptionModel: String { transcriptionModel }
+
+    private var transcriptionModel: String {
+        streamingRejected ? Config.fallbackTranscriptionModel : Config.model(.transcription)
+    }
+
+    /// Errors that will not fix themselves by retrying (bad key, no access to the model).
+    private static let fatalCodes: Set<String> = [
+        "invalid_api_key", "insufficient_quota", "model_not_found", "invalid_model",
+    ]
 
     // MARK: - Connection
 
     func connect() {
-        guard state != .connected, state != .connecting else { return }
+        guard !wantsConnection else { return }
+        wantsConnection = true
+        reconnectAttempt = 0
+        openSocket()
+    }
+
+    func disconnect() {
+        wantsConnection = false
+        reconnectWork?.cancel()
+        reconnectWork = nil
+        closeSocket()
+        state = .disconnected
+    }
+
+    private func openSocket() {
         guard let apiKey = KeychainStore.load() else {
-            state = .failed("No API key. Open Settings and paste your OpenAI key.")
-            onError?("No API key set.")
+            wantsConnection = false
+            state = .failed("Нет API-ключа — откройте Настройки.")
+            onError?("Нет API-ключа — откройте Настройки.")
             return
         }
-        state = .connecting
+        closeSocket()
+        state = reconnectAttempt == 0 ? .connecting : .reconnecting
 
-        var request = URLRequest(url: Config.realtimeURL)
+        streaming = Config.isStreamingTranscription(transcriptionModel)
+        flushSegmenter()
+        silenceDetector = SilenceDetector(speechThreshold: Config.speechRMSThreshold(for: speaker))
+
+        var request = URLRequest(url: streaming ? Config.transcriptionURL : Config.realtimeURL)
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         // GA interface: the `OpenAI-Beta: realtime=v1` header must NOT be sent.
 
@@ -77,25 +117,63 @@ final class RealtimeClient: NSObject, ObservableObject {
         // Do NOT start receiving yet — wait for `didOpenWithProtocol`.
         // Calling receive() before the socket is open throws POSIX 57
         // ("Socket is not connected") and tears the connection down.
-        isClosing = false
-        DebugLog.log("[\(speaker.rawValue)] connect(): resuming task")
+        DebugLog.log("[\(speaker.rawValue)] connect (attempt \(reconnectAttempt)) transcription=\(transcriptionModel) streaming=\(streaming)")
         task.resume()
     }
 
-    func disconnect() {
-        // Mark intentional close so the in-flight receive failure is ignored
-        // instead of surfacing "Socket is not connected" to the user.
-        isClosing = true
+    private func closeSocket() {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
+        // URLSession retains its delegate until invalidated — release it.
+        session?.invalidateAndCancel()
         session = nil
-        state = .disconnected
     }
 
-    /// Configure the session (GA schema): a realtime session with input-audio
-    /// transcription enabled, but NO automatic responses — we drive the reply
-    /// suggestion manually when the user presses the hotkey.
+    /// The socket dropped without us asking. Retry with back-off for as long as
+    /// the user still wants the session.
+    private func handleUnexpectedDrop(_ reason: String) {
+        guard wantsConnection else { return }
+        closeSocket()
+        reconnectAttempt += 1
+        let delay = Config.reconnectDelay(attempt: reconnectAttempt)
+        state = .reconnecting
+        DebugLog.log("[\(speaker.rawValue)] dropped (\(reason)) — reconnect #\(reconnectAttempt) in \(delay)s")
+        reconnectWork?.cancel()
+        reconnectWork = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self, self.wantsConnection else { return }
+            self.openSocket()
+        }
+    }
+
+    /// Configure the session (GA schema): input-audio transcription enabled and
+    /// NO automatic responses — this socket only ever transcribes.
     private func configureSession() {
+        if streaming {
+            // Streaming transcription session: text deltas arrive while the person
+            // speaks. No server turn detection — we commit on client-detected silence.
+            send([
+                "type": "session.update",
+                "session": [
+                    "type": "transcription",
+                    "audio": [
+                        "input": [
+                            "format": [
+                                "type": "audio/pcm",
+                                "rate": Int(Config.realtimeSampleRate),
+                            ],
+                            "transcription": [
+                                "model": transcriptionModel,
+                                "languages": ["en"],
+                                "delay": Config.streamingDelay,
+                            ],
+                            "turn_detection": NSNull(),
+                        ],
+                    ],
+                ],
+            ])
+            return
+        }
         let event: [String: Any] = [
             "type": "session.update",
             "session": [
@@ -108,19 +186,17 @@ final class RealtimeClient: NSObject, ObservableObject {
                             "rate": Int(Config.realtimeSampleRate),
                         ],
                         "transcription": [
-                            "model": "gpt-4o-transcribe",
+                            "model": transcriptionModel,
                             "language": "en",
                         ],
                         // Server VAD detects speech boundaries and auto-commits the
                         // audio buffer, which is what triggers transcription. We keep
-                        // `create_response: false` so it NEVER auto-replies — reply
-                        // suggestions stay manual (⌥Space). Without VAD the buffer is
-                        // never committed, no transcription fires, and the server
-                        // eventually closes the idle socket (close code 1001).
+                        // `create_response: false` so the model NEVER replies on this
+                        // socket. Without VAD the buffer is never committed, no
+                        // transcription fires, and the server eventually closes the
+                        // idle socket (close code 1001).
                         "turn_detection": [
                             "type": "server_vad",
-                            // Per-speaker: the mic side runs AEC so it needs a lower
-                            // threshold or VAD never fires and "You" lines never commit.
                             // IMPORTANT: must be a binary-clean Double — JSONSerialization
                             // prints e.g. 0.3 as "0.29999999999999999" (17 dp), which the
                             // API rejects (decimal_max_decimal_places_exceeded). Config only
@@ -145,63 +221,52 @@ final class RealtimeClient: NSObject, ObservableObject {
     private var audioChunkCount = 0
 
     /// Append a chunk of PCM16 mono 24kHz audio to the input buffer.
+    /// Audio that arrives while (re)connecting is dropped.
     func sendAudio(_ pcm16: Data) {
+        audioChunkCount += 1
         guard state == .connected else {
-            audioChunkCount += 1
-            if audioChunkCount % 50 == 1 {
-                DebugLog.log("sendAudio DROPPED (state=\(state)) — \(pcm16.count) bytes")
+            if audioChunkCount % 200 == 1 {
+                DebugLog.log("[\(speaker.rawValue)] sendAudio dropped (state=\(state))")
             }
             return
         }
-        audioChunkCount += 1
-        if audioChunkCount % 50 == 1 {
-            DebugLog.log("sendAudio OK #\(audioChunkCount) — \(pcm16.count) bytes")
+        if audioChunkCount % 500 == 1 {
+            DebugLog.log("[\(speaker.rawValue)] sendAudio OK #\(audioChunkCount) — \(pcm16.count) bytes")
         }
-        let event: [String: Any] = [
+        send([
             "type": "input_audio_buffer.append",
             "audio": pcm16.base64EncodedString(),
-        ]
-        send(event)
+        ])
+        // Streaming mode has no server VAD: tell the server when the utterance
+        // ended so it finalises the text and frees its buffer.
+        if streaming, silenceDetector.process(pcm16) {
+            send(["type": "input_audio_buffer.commit"])
+        }
     }
 
-    // MARK: - Suggestion request (hotkey)
+    // MARK: - Streaming text → sentences
 
-    /// Ask the model for ONE on-demand suggestion (reply / recap / follow-up)
-    /// based on the recent transcript.
-    func requestSuggestion(context: String, mode: SuggestionMode) {
-        guard state == .connected else {
-            onError?("Not connected yet.")
-            return
+    private func handleStreamingDelta(_ delta: String) {
+        for segment in segmenter.feed(delta) {
+            onTranscriptCompleted?(segment, speaker)
         }
-        let task: String
-        switch mode {
-        case .reply: task = "Suggest my spoken reply now."
-        case .recap: task = "Recap the conversation so far."
-        case .followUp: task = "Suggest one follow-up question I could ask."
-        }
-        let prompt = """
-        Recent transcript of the call (most recent line last):
-        ---
-        \(context.isEmpty ? "(no speech captured yet)" : context)
-        ---
-        \(task)
-        """
+        onPartialReplaced?(segmenter.buffer.trimmingCharacters(in: .whitespacesAndNewlines), speaker)
+    }
 
-        let event: [String: Any] = [
-            "type": "response.create",
-            "response": [
-                "output_modalities": ["text"],
-                "instructions": Config.suggestionInstructions(mode: mode, tone: tone),
-                "input": [[
-                    "type": "message",
-                    "role": "user",
-                    "content": [["type": "input_text", "text": prompt]],
-                ]],
-            ],
-        ]
-        // Mark the next response as the suggestion we care about.
-        pendingSuggestionResponseID = "pending"
-        send(event)
+    /// Utterance ended (or the socket is being replaced): emit the unfinished tail.
+    private func flushSegmenter() {
+        if let rest = segmenter.flush() {
+            onTranscriptCompleted?(rest, speaker)
+        }
+        onPartialReplaced?("", speaker)
+    }
+
+    /// The API refused the streaming session — reconnect with the older model.
+    private func fallBackFromStreaming(_ reason: String) {
+        DebugLog.log("[\(speaker.rawValue)] streaming transcription rejected (\(reason)) — falling back to \(Config.fallbackTranscriptionModel)")
+        streamingRejected = true
+        reconnectAttempt = 0
+        openSocket()
     }
 
     // MARK: - Send / receive plumbing
@@ -211,35 +276,24 @@ final class RealtimeClient: NSObject, ObservableObject {
         guard let data = try? JSONSerialization.data(withJSONObject: json),
               let string = String(data: data, encoding: .utf8)
         else { return }
-        task.send(.string(string)) { [weak self] error in
-            if let error {
-                Task { @MainActor in
-                    self?.log.error("WS send error: \(error.localizedDescription, privacy: .public)")
-                }
-            }
+        task.send(.string(string)) { _ in
+            // A failed send means the socket is going down; the receive loop
+            // reports that and triggers the reconnect.
         }
     }
 
-    private func receiveLoop() {
-        task?.receive { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                Task { @MainActor in
-                    if self.isClosing {
-                        // Expected teardown after disconnect() — stay quiet.
-                        DebugLog.log("[\(self.speaker.rawValue)] receive ended (intentional close)")
-                        return
-                    }
-                    DebugLog.log("[\(self.speaker.rawValue)] receiveLoop FAILURE: \(error.localizedDescription)")
-                    self.state = .failed(error.localizedDescription)
-                    self.onError?(error.localizedDescription)
+    private func receiveLoop(on socket: URLSessionWebSocketTask) {
+        socket.receive { [weak self] result in
+            Task { @MainActor in
+                // Ignore callbacks from a socket we've already replaced or closed.
+                guard let self, self.task === socket else { return }
+                switch result {
+                case .failure(let error):
+                    self.handleUnexpectedDrop(error.localizedDescription)
+                case .success(let message):
+                    if case let .string(text) = message { self.handleEvent(text) }
+                    self.receiveLoop(on: socket)
                 }
-            case .success(let message):
-                if case let .string(text) = message {
-                    Task { @MainActor in self.handleEvent(text) }
-                }
-                self.receiveLoop()
             }
         }
     }
@@ -252,47 +306,54 @@ final class RealtimeClient: NSObject, ObservableObject {
               let type = obj["type"] as? String
         else { return }
 
-        // Log everything except the high-frequency transcription deltas.
-        // Tag with the speaker so You/Them sessions are distinguishable in the log.
-        if type != "conversation.item.input_audio_transcription.delta" {
-            DebugLog.log("[\(speaker.rawValue)] EVENT: \(type)")
-        }
-
         switch type {
-        case "session.created":
+        case "session.created", "transcription_session.created":
             // Configure as soon as the session exists.
             configureSession()
 
-        case "session.updated":
+        case "session.updated", "transcription_session.updated":
+            reconnectAttempt = 0
             state = .connected
-            DebugLog.log("STATE = connected")
+            DebugLog.log("[\(speaker.rawValue)] connected")
 
         // --- Live transcription of this client's audio source ---
         case "conversation.item.input_audio_transcription.delta":
-            if let delta = obj["delta"] as? String { onTranscriptDelta?(delta, speaker) }
+            if let delta = obj["delta"] as? String {
+                if streaming { handleStreamingDelta(delta) } else { onTranscriptDelta?(delta, speaker) }
+            }
 
         case "conversation.item.input_audio_transcription.completed":
-            if let transcript = obj["transcript"] as? String {
+            if streaming {
+                // Lines were already emitted sentence by sentence from the deltas;
+                // only the unfinished tail is left.
+                flushSegmenter()
+            } else if let transcript = obj["transcript"] as? String {
                 onTranscriptCompleted?(transcript, speaker)
             }
 
-        // --- Suggestion text streaming back ---
-        case "response.text.delta", "response.output_text.delta":
-            if let delta = obj["delta"] as? String { onSuggestionDelta?(delta) }
-
-        case "response.done", "response.completed":
-            if pendingSuggestionResponseID != nil {
-                pendingSuggestionResponseID = nil
-                onSuggestionDone?()
-            }
+        case "conversation.item.input_audio_transcription.failed":
+            let err = obj["error"] as? [String: Any]
+            DebugLog.log("[\(speaker.rawValue)] transcription failed: \(err?["message"] as? String ?? "?")")
 
         case "error":
             let err = obj["error"] as? [String: Any]
             let message = err?["message"] as? String ?? "Unknown realtime error"
             let code = err?["code"] as? String ?? "?"
-            let param = err?["param"] as? String ?? "?"
-            DebugLog.log("[\(speaker.rawValue)] REALTIME ERROR code=\(code) param=\(param): \(message)")
-            log.error("Realtime error: \(message, privacy: .public)")
+            DebugLog.log("[\(speaker.rawValue)] REALTIME ERROR code=\(code): \(message)")
+            if streaming, state != .connected {
+                // The streaming session could not be set up — use the older model.
+                fallBackFromStreaming("\(code): \(message)")
+                return
+            }
+            // An empty-buffer commit after a false speech detection is harmless.
+            if code == "input_audio_buffer_commit_empty" { return }
+            if Self.fatalCodes.contains(code) {
+                // Retrying will not help — stop and tell the user.
+                wantsConnection = false
+                reconnectWork?.cancel()
+                closeSocket()
+                state = .failed(message)
+            }
             onError?(message)
 
         default:
@@ -311,9 +372,15 @@ extension RealtimeClient: URLSessionWebSocketDelegate {
     ) {
         // Socket is genuinely open now — safe to start receiving.
         Task { @MainActor in
-            self.log.info("WebSocket opened")
-            DebugLog.log("WebSocket OPENED — starting receive loop")
-            self.receiveLoop()
+            guard self.task === webSocketTask else { return }
+            self.receiveLoop(on: webSocketTask)
+            guard self.streaming else { return }
+            // If the streaming session never becomes ready, don't leave the user
+            // staring at "Connecting…" — switch to the older model.
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            if self.task === webSocketTask, self.streaming, self.state != .connected {
+                self.fallBackFromStreaming("not ready after 6s")
+            }
         }
     }
 
@@ -325,9 +392,30 @@ extension RealtimeClient: URLSessionWebSocketDelegate {
     ) {
         let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         Task { @MainActor in
-            self.state = .disconnected
-            self.log.info("WebSocket closed: \(closeCode.rawValue)")
-            DebugLog.log("WebSocket CLOSED code=\(closeCode.rawValue) reason=\(reasonText)")
+            guard self.task === webSocketTask else { return }
+            self.handleUnexpectedDrop("closed \(closeCode.rawValue) \(reasonText)")
+        }
+    }
+
+    /// Handshake failures (401 bad key, 403/404 no model access, no network) land here.
+    nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let status = (task.response as? HTTPURLResponse)?.statusCode
+        Task { @MainActor in
+            guard self.task === task else { return }
+            if self.streaming, let status, [400, 403, 404].contains(status) {
+                self.fallBackFromStreaming("handshake HTTP \(status)")
+            } else if let status, [401, 403, 404].contains(status) {
+                let message = status == 401
+                    ? "OpenAI отклонил API-ключ (401). Проверьте ключ в Настройках."
+                    : "Нет доступа к модели \(Config.model(.realtime)) (HTTP \(status)). Проверьте имя модели в Настройках."
+                DebugLog.log("[\(self.speaker.rawValue)] handshake rejected: \(status)")
+                self.wantsConnection = false
+                self.closeSocket()
+                self.state = .failed(message)
+                self.onError?(message)
+            } else {
+                self.handleUnexpectedDrop(error?.localizedDescription ?? "completed")
+            }
         }
     }
 }

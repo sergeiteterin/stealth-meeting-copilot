@@ -7,7 +7,7 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "0.2.0"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
     DEVELOPMENT_TEAM: ""
@@ -25,6 +25,10 @@ targets:
         buildPhase: none
       - path: Resources/Stealth.entitlements
         buildPhase: none
+      # Default meeting profiles (Markdown), copied into the bundle as a folder.
+      - path: Resources/Profiles
+        type: folder
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stealth.app
@@ -32,3 +36,30 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Resources/Stealth.entitlements
         GENERATE_INFOPLIST_FILE: NO
         ASSETCATALOG_COMPILER_APPICON_NAME: ""
+    scheme:
+      testTargets:
+        - StealthTests
+
+  # Logic tests. Not hosted by the app: the pure (Foundation-only) source files
+  # are compiled straight into the test bundle, so tests need no permissions,
+  # no API key and no network.
+  StealthTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+      - path: Sources/Stealth/Support/Config.swift
+      - path: Sources/Stealth/Support/DebugLog.swift
+      - path: Sources/Stealth/Support/CostMeter.swift
+      - path: Sources/Stealth/LLM/QuestionDetector.swift
+      - path: Sources/Stealth/LLM/SSEParser.swift
+      - path: Sources/Stealth/LLM/SentenceSegmenter.swift
+      - path: Sources/Stealth/Stores/TranscriptStore.swift
+      - path: Sources/Stealth/Stores/SessionRecord.swift
+      - path: Sources/Stealth/Stores/NoteExporter.swift
+      - path: Sources/Stealth/Context/ProfileStore.swift
+      - path: Sources/Stealth/Context/GoalStore.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stealth.tests
+        GENERATE_INFOPLIST_FILE: YES
